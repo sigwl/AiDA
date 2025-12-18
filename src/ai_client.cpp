@@ -633,21 +633,72 @@ std::string AnthropicClient::_get_api_host() const
 std::string AnthropicClient::_get_api_path(const std::string&) const { return "/v1/messages"; }
 httplib::Headers AnthropicClient::_get_api_headers() const
 {
-    return {
+    httplib::Headers headers = {
         {"x-api-key", _settings.anthropic_api_key},
         {"anthropic-version", "2023-06-01"},
         {"Content-Type", "application/json"}
     };
+
+    if (_model_name.find("claude-opus-4-5") != std::string::npos)
+    {
+        headers.emplace("anthropic-beta", "effort-2025-11-24");
+    }
+    else if (_model_name.find("claude-3-7-sonnet") != std::string::npos)
+    {
+        headers.emplace("anthropic-beta", "output-128k-2025-02-19");
+    }
+
+    return headers;
 }
 json AnthropicClient::_get_api_payload(const std::string& prompt_text, double temperature) const
 {
-    return {
-        {"model", _model_name},
+    std::string model_id = _model_name;
+    std::string effort = "";
+    bool use_thinking = false;
+
+    if (model_id == "claude-opus-4-5 (High Effort)")
+    {
+        model_id = "claude-opus-4-5";
+        effort = "high";
+    }
+    else if (model_id == "claude-opus-4-5 (Medium Effort)")
+    {
+        model_id = "claude-opus-4-5";
+        effort = "medium";
+    }
+    else if (model_id == "claude-opus-4-5 (Low Effort)")
+    {
+        model_id = "claude-opus-4-5";
+        effort = "low";
+    }
+    else if (model_id == "claude-3-7-sonnet-thought")
+    {
+        model_id = "claude-3-7-sonnet";
+        use_thinking = true;
+    }
+
+    json payload = {
+        {"model", model_id},
         {"system", BASE_PROMPT},
         {"messages", {{{"role", "user"}, {"content", prompt_text}}}},
-        {"max_tokens", 4096},
-        {"temperature", temperature}
+        {"max_tokens", 4096}
     };
+
+    if (!effort.empty())
+    {
+        payload["output_config"] = { {"effort", effort} };
+    }
+    else if (use_thinking)
+    {
+        payload["thinking"] = { {"type", "enabled"}, {"budget_tokens", 4096} };
+        payload["max_tokens"] = 8192; // Increase limit for thoughts
+    }
+    else
+    {
+        payload["temperature"] = temperature;
+    }
+
+    return payload;
 }
 
 std::string AnthropicClient::_parse_api_response(const json& jres) const
@@ -668,7 +719,7 @@ std::string AnthropicClient::_parse_api_response(const json& jres) const
     }
 
     const auto content = jres.value("content", json::array());
-    if (content.empty() || !content[0].is_object())
+    if (content.empty())
     {
         if (jres.contains("promptFeedback") && jres["promptFeedback"].contains("blockReason")) {
             std::string reason = jres["promptFeedback"]["blockReason"].get<std::string>();
@@ -679,16 +730,29 @@ std::string AnthropicClient::_parse_api_response(const json& jres) const
         return "Error: Received invalid 'content' array from API.";
     }
 
-    const auto& first_content = content[0];
-    std::string finish_reason = first_content.value("finish_reason", "UNKNOWN");
-
-    if (finish_reason != "stop" && finish_reason != "STOP")
+    std::string stop_reason = jres.value("stop_reason", "UNKNOWN");
+    if (stop_reason != "end_turn" && stop_reason != "max_tokens")
     {
-        msg("AiDA: Anthropic API returned a non-STOP finish reason: %s\n", finish_reason.c_str());
-        return "Error: API request finished unexpectedly. Reason: " + finish_reason;
+        msg("AiDA: Anthropic API returned a non-success stop reason: %s\n", stop_reason.c_str());
+        return "Error: API request finished unexpectedly. Reason: " + stop_reason;
     }
 
-    return first_content.value("text", "Error: 'text' field not found in API response.");
+    std::string result_text;
+    for (const auto& block : content)
+    {
+        if (block.is_object() && block.value("type", "") == "text")
+        {
+            result_text += block.value("text", "");
+        }
+    }
+
+    if (result_text.empty())
+    {
+        msg("AiDA: No text content found in Anthropic API response.\nResponse body: %s\n", jres.dump(2).c_str());
+        return "Error: No text content found in API response.";
+    }
+
+    return result_text;
 }
 
 CopilotClient::CopilotClient(const settings_t& settings) : AIClient(settings)
